@@ -426,7 +426,7 @@ def roster_counts(owner: str) -> Dict[str, int]:
 
 def run_risk(
     settings: LeagueSettings,
-    history: Optional[pd.DataFrame],
+    histories: Optional[List[pd.DataFrame]],
     draft_log: pd.DataFrame,
     available_df: pd.DataFrame
 ) -> Dict[str, float]:
@@ -436,18 +436,31 @@ def run_risk(
     denom = max(1, min(window, len(recent)))
     recent_score = {p: recent_counts.get(p, 0) / denom for p in POSITIONS}
 
-    if history is None or history.empty:
+    # Historical score: average across selected years for the current round
+    if not histories:
         hist_score = {p: 0.0 for p in POSITIONS}
     else:
         current_round = pick_to_round(next_pick_number(draft_log), settings.num_teams)
-        row = history[history["Round"] == current_round]
-        if len(row) == 1:
-            vals = row.iloc[0].drop(labels=["Round"]).astype(str)
-            counts = vals.value_counts().to_dict()
-            hist_score = {p: counts.get(p, 0) / settings.num_teams for p in POSITIONS}
-        else:
-            hist_score = {p: 0.0 for p in POSITIONS}
 
+        per_year_scores: List[Dict[str, float]] = []
+        for history in histories:
+            if history is None or history.empty:
+                continue
+            row = history[history["Round"] == current_round]
+            if len(row) == 1:
+                vals = row.iloc[0].drop(labels=["Round"]).astype(str)
+                counts = vals.value_counts().to_dict()
+                per_year_scores.append({p: counts.get(p, 0) / settings.num_teams for p in POSITIONS})
+
+        if not per_year_scores:
+            hist_score = {p: 0.0 for p in POSITIONS}
+        else:
+            hist_score = {
+                p: float(np.mean([s.get(p, 0.0) for s in per_year_scores]))
+                for p in POSITIONS
+            }
+
+    # Scarcity: if the top of a position is gone, risk goes up
     scarcity = {}
     for p in POSITIONS:
         top = available_df[(available_df["pos"] == p) & (available_df["available"])].nlargest(10, "vorp")
@@ -457,6 +470,7 @@ def run_risk(
     for p in POSITIONS:
         severity[p] = float(np.clip(0.45 * recent_score[p] + 0.35 * hist_score[p] + 0.20 * scarcity[p], 0.0, 1.0))
     return severity
+
 
 
 def best_available_by_pos(df: pd.DataFrame) -> pd.DataFrame:
@@ -622,56 +636,67 @@ if missing_pos:
 # History year selection for run tendencies
 year_options = sorted(list(history_blocks.keys()))
 if year_options:
-    settings.history_year = st.sidebar.selectbox(
-        "History year (run tendencies)",
-        year_options,
-        index=year_options.index(settings.history_year) if settings.history_year in year_options else 0,
+    # Default to the most recent year if nothing is selected yet
+    if "history_years" not in st.session_state:
+        st.session_state.history_years = [max(year_options)]
+
+    st.session_state.history_years = st.sidebar.multiselect(
+        "History years (run tendencies)",
+        options=year_options,
+        default=st.session_state.history_years,
+        help="Select one or more years. The model averages position tendencies across selected years.",
     )
 
-# Draft order in sidebar, draggable blocks replacing manual text
+# Draft order in sidebar, draggable blocks with numbers INSIDE the bubbles
 st.sidebar.subheader("Draft order")
 st.sidebar.caption("Drag owners to reorder, then click Submit (reset draft).")
 
-col_num, col_sort = st.sidebar.columns([0.18, 0.82])
+if HAS_SORTABLES:
+    custom_style = """
+    .sortable-component { padding: 0px; margin: 0px; }
+    .sortable-container { padding: 0px; margin: 0px; }
+    .sortable-item, .sortable-item:hover {
+        border-radius: 999px;
+        padding: 0.35rem 0.6rem;
+        margin: 0.25rem 0;
+        font-size: 13px;
+        line-height: 1.1;
+    }
+    """
 
-with col_num:
-    nums_html = "".join([f"<div class='slotnum'>{i}.</div>" for i in range(1, settings.num_teams + 1)])
-    st.markdown(nums_html, unsafe_allow_html=True)
+    # Render numbered items. After drag, we strip numbers and re-render.
+    numbered_items = [f"{i+1}. {name}" for i, name in enumerate(st.session_state.draft_order)]
 
-with col_sort:
-    if HAS_SORTABLES:
-        custom_style = """
-        .sortable-component { padding: 0px; margin: 0px; }
-        .sortable-container { padding: 0px; margin: 0px; }
-        .sortable-item, .sortable-item:hover {
-            border-radius: 999px;
-            padding: 0.35rem 0.6rem;
-            margin: 0.25rem 0;
-            font-size: 13px;
-            line-height: 1.1;
-        }
-        """
-        new_order = sort_items(
-            st.session_state.draft_order,
-            direction="vertical",
-            key="draft_order_sort",
-            custom_style=custom_style,
-        )
-    else:
-        st.warning("streamlit-sortables not installed. Install it locally and in requirements.txt.")
-        order_text = st.text_area(
-            "Enter owner order (comma or newline separated)",
-            value="\n".join(st.session_state.draft_order),
-            height=170,
-            key="draft_order_textarea",
-        )
-        new_order = [x.strip().upper() for x in re.split(r"[,\n]+", order_text) if x.strip()]
+    sorted_items = sort_items(
+        numbered_items,
+        direction="vertical",
+        key="draft_order_sort",
+        custom_style=custom_style,
+    )
+
+    # Strip "1. " prefix from each item to get the actual owner name
+    new_order = [
+        re.sub(r"^\s*\d+\.\s*", "", str(x)).strip().upper()
+        for x in sorted_items
+        if str(x).strip()
+    ]
+else:
+    st.warning("streamlit-sortables not installed. Install it locally and in requirements.txt.")
+    order_text = st.text_area(
+        "Enter owner order (comma or newline separated)",
+        value="\n".join(st.session_state.draft_order),
+        height=170,
+        key="draft_order_textarea",
+    )
+    new_order = [x.strip().upper() for x in re.split(r"[,\n]+", order_text) if x.strip()]
 
 if st.sidebar.button("Submit (reset draft)", key="submit_draft_order"):
     if len(new_order) != settings.num_teams:
         st.sidebar.error(f"Need exactly {settings.num_teams} owners. You entered {len(new_order)}.")
     else:
-        reset_draft(pool, [x.upper() for x in new_order])
+        reset_draft(pool, new_order)
+        st.rerun()
+l, [x.upper() for x in new_order])
         st.rerun()
 
 # Title
@@ -786,8 +811,10 @@ with left:
 
 with right:
     dl = st.session_state.draft_log.copy()
-    hist = history_blocks.get(settings.history_year, None)
-    sev = run_risk(settings, hist, dl, pool_vorp)
+    selected_years = st.session_state.get("history_years", [])
+    selected_histories = [history_blocks[y] for y in selected_years if y in history_blocks]
+    sev = run_risk(settings, selected_histories, dl, pool_vorp)
+
 
     # Run risk: position and bar on same line
     st.markdown("### Run risk")
@@ -797,6 +824,11 @@ with right:
             st.write(pos)
         with c2:
             st.progress(int(sev[pos] * 100))
+            st.caption(
+                "Run detection estimates whether a position is starting to be drafted in a cluster. "
+                "It combines the last few picks with historical round tendencies to warn you when a position may thin out soon."
+            )
+
 
     # Best pick now above best available
     st.markdown("### Best pick now")
@@ -868,3 +900,4 @@ if analysis.empty:
 else:
     st_df(analysis, hide_index=True)
     st.caption("Ranking is based primarily on starter strength (VORP and projected points), with a small depth adjustment.")
+
